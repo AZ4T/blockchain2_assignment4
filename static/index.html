@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AI Crypto Assistant</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 40px auto; }
+    #response { white-space: pre-wrap; margin-top: 1em;
+                background: #f9f9f9; padding: 1em; border:1px solid #ddd; }
+    input, button { font-size: 1em; padding: 0.5em; margin-right: 0.5em; }
+  </style>
+</head>
+<body>
+  <h1>AI Crypto Assistant</h1>
+  <input id="questionInput" placeholder="Tell me about Bitcoin" style="width:70%;" />
+  <button id="askBtn">Ask</button>
+  <div id="response">Your answer will appear here.</div>
+  <script>
+    const inp = document.getElementById("questionInput");
+    const btn = document.getElementById("askBtn");
+    const out = document.getElementById("response");
+
+    btn.addEventListener("click", async () => {
+      const question = inp.value.trim();
+      if (!question) { out.textContent = "Please ask something."; return; }
+      out.textContent = "Thinking…";
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question })
+        });
+        if (!res.ok) {
+          out.textContent = `Error ${res.status}: ${res.statusText}`;
+          return;
+        }
+        const { answer } = await res.json();
+        out.textContent = answer;
+      } catch (err) {
+        console.error(err);
+        out.textContent = "Fetch error.";
+      }
+    });
+  </script>
+</body>
+</html>
