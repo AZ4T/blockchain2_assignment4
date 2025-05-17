@@ -1,4 +1,6 @@
 # src/main.py
+import re
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -6,15 +8,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-import logging
-
 from .services.exchange_service import get_price_cg
-from .services.market_service import get_market_data
-from .services.news_service import get_headlines
+from .services.market_service   import get_market_data
+from .services.news_service     import get_headlines
 from .ai_client import answer_query
 
 app = FastAPI()
-
 logger = logging.getLogger("uvicorn.error")
 
 class ChatRequest(BaseModel):
@@ -23,26 +22,47 @@ class ChatRequest(BaseModel):
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     q = req.question.strip()
-    symbol = q.replace("?", "").upper().split()[-1]
+    price = None
+    symbol = None
+
+    # 1) detect “price of XXX” queries and extract the ticker
+    m = re.search(r"price of\s+([A-Za-z]+)", q, re.IGNORECASE)
+    if m:
+        symbol = m.group(1).upper()
+        try:
+            price = await get_price_cg(symbol)
+        except Exception as e:
+            logger.error(f"Price lookup failed for {symbol}: {e}")
+            raise HTTPException(404, detail=f"Could not find price for symbol '{symbol}'")
+
+    # 2) build a prompt for the LLM
+    if price is not None:
+        prompt = f"The current price of {symbol} is ${price:.2f} USD. {q}"
+    else:
+        prompt = q
+
+    # 3) hand off to your local GPT‐2 pipeline (or any other model)
     try:
-        # 1) fetch on‐chain price
-        symbol = req.question.strip().upper()
-        price = await get_price_cg(symbol)
-        # 2) build a prompt for GPT-2
-        prompt = (
-            f"You are a crypto assistant.\n"
-            f"The current price of {symbol} is ${price:.2f}.\n"
-            f"User asked: {req.question}\n"
-            f"Please answer concisely:"
-        )
-        # 3) generate with our local pipeline
-        answer = await answer_query(prompt, max_new_tokens=100)
-        return {"answer": answer}
+        raw = await answer_query(prompt)
+        # unwrap if it's an OpenAI‐style dict or HF dict
+        if isinstance(raw, dict):
+            # OpenAI ChatCompletion → { choices: [ { message: { content } } ] }
+            if "choices" in raw:
+                choice = raw["choices"][0]
+                # either GPT‐2 style: .text, or ChatCompletion: .message.content
+                text = choice.get("text") or choice.get("message", {}).get("content", "")
+            # HuggingFace inference → [ { generated_text: "…" } ]
+            elif isinstance(raw, list) and raw and "generated_text" in raw[0]:
+                text = raw[0]["generated_text"]
+            else:
+                # fallback
+                text = str(raw)
+        else:
+            text = str(raw)
+        return {"answer": text.strip()}
     except Exception as e:
-        # log the full stack-trace
-        logger.exception("❌ error in /api/chat")
-        # return the message to the client (first 300 chars)
-        raise HTTPException(status_code=500, detail=str(e)[:300])
+        logger.error(f"LLM call failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal LLM error")
 
 
 class TokenResponse(BaseModel):

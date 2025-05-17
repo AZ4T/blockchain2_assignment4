@@ -1,30 +1,28 @@
 # src/ai_client.py
-import asyncio
 from functools import lru_cache
-
-from transformers import pipeline
+from llama_cpp import Llama
 from starlette.concurrency import run_in_threadpool
 
 @lru_cache()
-def _get_generator():
-    """
-    Lazily load (and cache) a local GPT-2 text‐generation pipeline.
-    """
-    return pipeline("text-generation", model="gpt2")
+def _get_llm():
+    # no leading slash → project-relative path
+    return Llama(model_path="models/llama-2-7b-chat.Q4_0.gguf",
+                n_ctx=1024,
+                use_mlock=True)      # optional: keep weights in RAM
 
-async def answer_query(prompt: str, max_new_tokens: int = 50) -> str:
-    """
-    Asynchronously run GPT-2 locally to complete the given prompt.
-    """
-    generator = _get_generator()
-    # Offload the blocking .__call__ to a threadpool
-    outputs = await run_in_threadpool(
-        generator,
-        prompt,
-        max_new_tokens=max_new_tokens,
-        do_sample=True,         # enable sampling
-        temperature=0.7,        # control diversity
-        top_p=0.9,              # nucleus sampling
-        pad_token_id=generator.tokenizer.eos_token_id
-    )
-    return outputs[0]["generated_text"]
+async def answer_query(prompt: str, max_tokens: int = 256) -> str:
+    llm = _get_llm()
+
+    def _sync_call():
+        # wrap prompt in the Meta “chat” instruction tokens:
+        chat_prompt = f"<s>[INST] {prompt} [/INST]</s>"
+        raw = llm(
+            prompt=chat_prompt,
+            max_tokens=max_tokens,
+            stop=["</s>"]
+        )
+        # llama-cpp returns a plain string
+        text = raw["choices"][0]["text"]
+        return text.lstrip()
+
+    return await run_in_threadpool(_sync_call)
