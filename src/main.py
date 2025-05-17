@@ -1,13 +1,16 @@
 # src/main.py
 import re
 import logging
+import asyncio
 from pathlib import Path
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .schemas import ChatRequest, ChatResponse
 from .services.exchange_service import get_price_cg
 from .services.market_service   import get_market_data
 from .services.news_service     import get_headlines
@@ -19,50 +22,62 @@ logger = logging.getLogger("uvicorn.error")
 class ChatRequest(BaseModel):
     question: str
 
-@app.post("/api/chat")
+_STOP = {"WHAT","IS","THE","PRICE","OF","TELL","ME","ABOUT","LATEST","NEWS","AND"}
+
+def extract_symbol(text: str) -> Optional[str]:
+    tokens   = re.findall(r"\b[A-Za-z]{2,5}\b", text)
+    filtered = [t for t in tokens if t.upper() not in _STOP]
+    return filtered[-1].upper() if filtered else None
+
+@app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    q = req.question.strip()
-    price = None
-    symbol = None
+    question = req.question.strip()
+    symbol   = extract_symbol(question)
 
-    # 1) detect “price of XXX” queries and extract the ticker
-    m = re.search(r"price of\s+([A-Za-z]+)", q, re.IGNORECASE)
-    if m:
-        symbol = m.group(1).upper()
+    price, mkt, news = None, None, None
+    if symbol:
         try:
-            price = await get_price_cg(symbol)
+            price_coro  = get_price_cg(symbol)
+            market_coro = get_market_data(symbol)
+            news_coro   = get_headlines(symbol)
+            price, mkt, news = await asyncio.gather(
+                price_coro, market_coro, news_coro
+            )
         except Exception as e:
-            logger.error(f"Price lookup failed for {symbol}: {e}")
-            raise HTTPException(404, detail=f"Could not find price for symbol '{symbol}'")
+            logger.error(f"Fetch failed for {symbol}: {e}")
+            raise HTTPException(404, detail=f"Could not fetch data for '{symbol}'")
 
-    # 2) build a prompt for the LLM
-    if price is not None:
-        prompt = f"The current price of {symbol} is ${price:.2f} USD. {q}"
-    else:
-        prompt = q
+    # 2) Only if we got all three, build prompt context
+    context: List[str] = []
+    if symbol and price is not None and mkt and news:
+        context = [
+            f"Here’s the latest on {symbol}:",
+            f"- Price: ${price:,.2f}",                 # <-- real price now
+            f"- Market cap: ${mkt.cap:,.0f}",
+            f"- Rank: #{mkt.rank}",
+            "- Top headlines:"
+        ] + [
+            f"  {i+1}. {h.title} ({h.source})"
+            for i,h in enumerate(news)
+        ]
 
-    # 3) hand off to your local GPT‐2 pipeline (or any other model)
+    prompt = (
+        ("\n".join(context) + "\n\n") if context else ""
+    ) + f"User asked: “{question}”\nAnswer concisely based on the data above."
+
     try:
-        raw = await answer_query(prompt)
-        # unwrap if it's an OpenAI‐style dict or HF dict
-        if isinstance(raw, dict):
-            # OpenAI ChatCompletion → { choices: [ { message: { content } } ] }
-            if "choices" in raw:
-                choice = raw["choices"][0]
-                # either GPT‐2 style: .text, or ChatCompletion: .message.content
-                text = choice.get("text") or choice.get("message", {}).get("content", "")
-            # HuggingFace inference → [ { generated_text: "…" } ]
-            elif isinstance(raw, list) and raw and "generated_text" in raw[0]:
-                text = raw[0]["generated_text"]
-            else:
-                # fallback
-                text = str(raw)
-        else:
-            text = str(raw)
-        return {"answer": text.strip()}
+        ai_text = await answer_query(prompt)
     except Exception as e:
-        logger.error(f"LLM call failed: {e}")
-        raise HTTPException(status_code=500, detail="Internal LLM error")
+        logger.error(f"LLM error: {e}")
+        raise HTTPException(500, detail="Internal LLM error")
+
+    return ChatResponse(
+        answer     = ai_text.strip(),
+        price      = price,
+        market_cap = mkt.cap  if mkt else None,
+        rank       = mkt.rank if mkt else None,
+        headlines  = [h.title for h in news] if news else None,
+    )
 
 
 class TokenResponse(BaseModel):
@@ -97,6 +112,7 @@ async def news(symbol: str):
 # static files
 BASE_DIR = Path(__file__).parent.parent
 static_dir = BASE_DIR / "static"
+
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 @app.get("/")
